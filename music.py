@@ -1,427 +1,203 @@
-import 'dart:async';
-import 'dart:convert';
-import 'package:flutter/material.dart';
-import 'package:just_audio/just_audio.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:intl/intl.dart';
+# music.py
+import streamlit as st
+import os
+from datetime import datetime, timedelta
 
-void main() {
-  runApp(MyApp());
-}
+# optional: use mutagen to get exact mp3 duration if available
+try:
+    from mutagen.mp3 import MP3
+    MUTAGEN_AVAILABLE = True
+except Exception:
+    MUTAGEN_AVAILABLE = False
 
-class SongItem {
-  final String id; // unique id (use asset path)
-  final String title;
-  final String assetPath;
+st.set_page_config(page_title="Music App", layout="centered")
 
-  SongItem({required this.id, required this.title, required this.assetPath});
-}
+# ---------------- Settings ----------------
+MUSIC_FOLDER = "music"
+ESTIMATED_SONG_LENGTH = 180  # seconds fallback if mutagen not available
 
-class MyApp extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Advanced Music App',
-      theme: ThemeData(
-        primarySwatch: Colors.indigo,
-      ),
-      home: MusicHomePage(),
-    );
-  }
-}
+# Ensure music folder exists
+if not os.path.exists(MUSIC_FOLDER):
+    try:
+        os.makedirs(MUSIC_FOLDER, exist_ok=True)
+    except Exception as e:
+        st.error(f"Unable to create music folder: {e}")
+        st.stop()
 
-class MusicHomePage extends StatefulWidget {
-  @override
-  State<MusicHomePage> createState() => _MusicHomePageState();
-}
+# ---------------- Session State ----------------
+if "play_count" not in st.session_state:
+    st.session_state.play_count = {}  # {song: [datetime, ...]}
 
-class _MusicHomePageState extends State<MusicHomePage> {
-  // Built-in songs (update titles & asset paths to match your assets)
-  final List<SongItem> songs = [
-    SongItem(id: 'song1', title: 'Sunny Breeze', assetPath: 'assets/songs/song1.mp3'),
-    SongItem(id: 'song2', title: 'Evening Chill', assetPath: 'assets/songs/song2.mp3'),
-    SongItem(id: 'song3', title: 'Road Trip', assetPath: 'assets/songs/song3.mp3'),
-  ];
+if "favorite_songs" not in st.session_state:
+    st.session_state.favorite_songs = []
 
-  final AudioPlayer _player = AudioPlayer();
-  int _currentIndex = -1;
-  bool _isPlaying = false;
-  Duration _currentPosition = Duration.zero;
-  Duration _currentDuration = Duration.zero;
+if "total_music_time" not in st.session_state:
+    st.session_state.total_music_time = 0  # seconds
 
-  // Persistent data keys
-  static const String KEY_PLAY_LOG = 'play_log'; // map songId -> list of ISO timestamps
-  static const String KEY_FAVORITES = 'favorites'; // list of songId
-  static const String KEY_TOTAL_SECONDS = 'total_seconds'; // int
+if "durations" not in st.session_state:
+    st.session_state.durations = {}
 
-  Map<String, List<DateTime>> playLog = {}; // in-memory
-  List<String> favorites = [];
-  int totalSeconds = 0;
+# ---------------- Helpers ----------------
+def get_music_files():
+    """Return list of mp3 files in MUSIC_FOLDER sorted alphabetically."""
+    try:
+        return sorted([f for f in os.listdir(MUSIC_FOLDER) if f.lower().endswith(".mp3")])
+    except FileNotFoundError:
+        return []
 
-  Timer? _positionTimer;
-  StreamSubscription<Duration>? _posSub;
-  StreamSubscription<PlayerState>? _playerStateSub;
+def save_uploaded_files(uploaded_files):
+    """Save uploaded files into MUSIC_FOLDER. Avoid overwrite by adding index if needed."""
+    saved = []
+    for up in uploaded_files:
+        fname = up.name
+        base, ext = os.path.splitext(fname)
+        candidate = fname
+        i = 1
+        while os.path.exists(os.path.join(MUSIC_FOLDER, candidate)):
+            candidate = f"{base}_{i}{ext}"
+            i += 1
+        path = os.path.join(MUSIC_FOLDER, candidate)
+        with open(path, "wb") as f:
+            f.write(up.getbuffer())
+        saved.append(candidate)
+    return saved
 
-  @override
-  void initState() {
-    super.initState();
-    _loadPersistentState();
-    _player.durationStream.listen((d) {
-      if (d != null) {
-        setState(() => _currentDuration = d);
-      }
-    });
-    _posSub = _player.positionStream.listen((p) {
-      setState(() => _currentPosition = p);
-    });
-    _playerStateSub = _player.playerStateStream.listen((state) {
-      final playing = state.playing;
-      setState(() => _isPlaying = playing);
-      // when playback completes, handle total time addition (if we haven't yet)
-      if (state.processingState == ProcessingState.completed) {
-        _onSongComplete();
-      }
-    });
-  }
+def get_duration_seconds(filename):
+    """Return duration in seconds for mp3 using mutagen if available, else estimate."""
+    if filename in st.session_state.durations:
+        return st.session_state.durations[filename]
+    full = os.path.join(MUSIC_FOLDER, filename)
+    if MUTAGEN_AVAILABLE:
+        try:
+            audio = MP3(full)
+            dur = int(audio.info.length)
+            st.session_state.durations[filename] = dur
+            return dur
+        except Exception:
+            pass
+    st.session_state.durations[filename] = ESTIMATED_SONG_LENGTH
+    return ESTIMATED_SONG_LENGTH
 
-  @override
-  void dispose() {
-    _player.dispose();
-    _posSub?.cancel();
-    _playerStateSub?.cancel();
-    _positionTimer?.cancel();
-    super.dispose();
-  }
+def update_play_count(song):
+    """Record a play timestamp, prune to 24 hours, update favorites if >=4 plays."""
+    now = datetime.now()
+    if song not in st.session_state.play_count:
+        st.session_state.play_count[song] = []
+    st.session_state.play_count[song].append(now)
+    cutoff = now - timedelta(hours=24)
+    st.session_state.play_count[song] = [
+        t for t in st.session_state.play_count[song] if t > cutoff
+    ]
+    if len(st.session_state.play_count[song]) >= 4 and song not in st.session_state.favorite_songs:
+        st.session_state.favorite_songs.append(song)
 
-  Future<void> _loadPersistentState() async {
-    final prefs = await SharedPreferences.getInstance();
-    // load play log
-    final playLogRaw = prefs.getString(KEY_PLAY_LOG);
-    if (playLogRaw != null) {
-      final Map<String, dynamic> decoded = json.decode(playLogRaw);
-      playLog = decoded.map((k, v) {
-        final List list = v as List;
-        final times = list.map<DateTime>((x) => DateTime.parse(x as String)).toList();
-        return MapEntry(k, times);
-      });
-    } else {
-      playLog = {};
-    }
-    // favorites
-    favorites = prefs.getStringList(KEY_FAVORITES) ?? [];
-    // total seconds
-    totalSeconds = prefs.getInt(KEY_TOTAL_SECONDS) ?? 0;
-    setState(() {});
-  }
+# ---------------- UI ----------------
+st.title("🎵 Music App — Fixed & Robust")
+st.write("Place `.mp3` files inside the `music/` folder or upload them below. Features:")
+st.write("- Tracks total listening time (by approximating from file duration).")
+st.write("- Auto-favorite a song if played 4+ times within 24 hours.")
 
-  Future<void> _savePersistentState() async {
-    final prefs = await SharedPreferences.getInstance();
-    // save play log as map of lists ISO strings
-    final Map<String, List<String>> toSave = {};
-    playLog.forEach((k, v) {
-      toSave[k] = v.map((d) => d.toIso8601String()).toList();
-    });
-    prefs.setString(KEY_PLAY_LOG, json.encode(toSave));
-    prefs.setStringList(KEY_FAVORITES, favorites);
-    prefs.setInt(KEY_TOTAL_SECONDS, totalSeconds);
-  }
+if MUTAGEN_AVAILABLE:
+    st.info("mutagen detected: durations will be accurate.")
+else:
+    st.info("mutagen not installed: using estimated duration (180s). Install `mutagen` for exact durations.")
 
-  Future<void> _playSong(int index) async {
-    try {
-      final song = songs[index];
-      // load asset
-      await _player.setAsset(song.assetPath);
-      await _player.play();
-      _currentIndex = index;
+# List songs
+songs = get_music_files()
 
-      // record a play (timestamp) and check favorite logic
-      _recordPlayAndMaybeFavorite(song.id);
+# Upload UI when no songs exist
+if not songs:
+    st.warning("No `.mp3` files found in the `music/` folder.")
+    uploaded = st.file_uploader("Upload one or more MP3 files", type=["mp3"], accept_multiple_files=True)
+    if uploaded:
+        saved = save_uploaded_files(uploaded)
+        st.success(f"Saved {len(saved)} file(s): " + ", ".join(saved))
+        st.experimental_rerun()
+    st.stop()
 
-      // attempt to get duration (just_audio sets durationStream)
-      // if duration is available we will add to totalSeconds after playback completes
-      setState(() {});
-    } catch (e) {
-      // asset missing or other error
-      debugPrint('Playback error: $e');
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('Unable to play song: ${e.toString()}'),
-      ));
-    }
-  }
+# Show selection and playback controls
+selected_song = st.selectbox("Choose a song to play", songs)
 
-  Future<void> _pauseSong() async {
-    await _player.pause();
-  }
+col1, col2 = st.columns([3,1])
+with col1:
+    song_path = os.path.join(MUSIC_FOLDER, selected_song)
+    try:
+        with open(song_path, "rb") as f:
+            audio_bytes = f.read()
+        st.audio(audio_bytes, format="audio/mp3")
+    except Exception as e:
+        st.error(f"Unable to read {selected_song}: {e}")
 
-  Future<void> _stopSong() async {
-    await _player.stop();
-    setState(() {
-      _currentIndex = -1;
-      _currentPosition = Duration.zero;
-      _currentDuration = Duration.zero;
-    });
-  }
+with col2:
+    duration = get_duration_seconds(selected_song)
+    mins = duration // 60
+    secs = duration % 60
+    st.metric("Duration", f"{mins}m {secs}s")
 
-  void _recordPlayAndMaybeFavorite(String songId) {
-    final now = DateTime.now();
+play_btn = st.button("▶️ Count as Played")
 
-    // append timestamp
-    if (!playLog.containsKey(songId)) playLog[songId] = [];
-    playLog[songId]!.add(now);
+# Sidebar uploader for convenience
+with st.sidebar.expander("Upload MP3s"):
+    up_files = st.file_uploader("Select MP3 files", type=["mp3"], accept_multiple_files=True, key="sidebar_uploader")
+    if st.button("Save uploaded files", key="save_uploads"):
+        if up_files:
+            saved = save_uploaded_files(up_files)
+            st.success(f"Saved {len(saved)} file(s): " + ", ".join(saved))
+            st.experimental_rerun()
+        else:
+            st.info("No files selected to save.")
 
-    // prune timestamps older than 24 hours
-    final cutoff = now.subtract(Duration(hours: 24));
-    playLog[songId] = playLog[songId]!.where((t) => t.isAfter(cutoff)).toList();
+# Play action handling
+if play_btn:
+    update_play_count(selected_song)
+    dur = get_duration_seconds(selected_song)
+    st.session_state.total_music_time += dur
+    st.success(f"Recorded play for **{selected_song}** (+{dur} sec)")
 
-    // if plays >= 4 in last 24 hours => add to favorites
-    if (playLog[songId]!.length >= 4 && !favorites.contains(songId)) {
-      favorites.add(songId);
-      // notify user
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('Added to Favorites: ${_getTitleById(songId)}'),
-        backgroundColor: Colors.green,
-      ));
-    }
+# Stats
+st.subheader("📊 Music Stats")
+total_seconds = st.session_state.total_music_time
+hours = total_seconds // 3600
+minutes = (total_seconds % 3600) // 60
+seconds = total_seconds % 60
+st.metric("Total Listening Time", f"{hours}h {minutes}m {seconds}s")
 
-    // persist
-    _savePersistentState();
-    setState(() {});
-  }
+st.write("**Favorite Playlist (auto)** — songs played 4+ times within last 24 hours")
+if st.session_state.favorite_songs:
+    for sname in st.session_state.favorite_songs:
+        st.markdown(f"- 🎶 **{sname}**")
+else:
+    st.info("No favorites yet. Play any song 4+ times within 24 hours to add it automatically.")
 
-  Future<void> _onSongComplete() async {
-    // Add duration to totalSeconds if duration known
-    final dur = _currentDuration.inSeconds;
-    if (dur > 0) {
-      totalSeconds += dur;
-    } else {
-      // fallback: add 180 seconds
-      totalSeconds += 180;
-    }
-    await _savePersistentState();
-    setState(() {});
-    // reset player so repeated plays record again
-    await _player.stop();
-  }
+with st.expander("🔎 Play count log (last 24 hrs per song)"):
+    pretty = {k: [t.strftime("%Y-%m-%d %H:%M:%S") for t in v] for k, v in st.session_state.play_count.items()}
+    st.json(pretty)
 
-  String _formatTotalTime(int seconds) {
-    final hours = seconds ~/ 3600;
-    final minutes = (seconds % 3600) ~/ 60;
-    final secs = seconds % 60;
-    if (hours > 0) return '${hours}h ${minutes}m ${secs}s';
-    if (minutes > 0) return '${minutes}m ${secs}s';
-    return '${secs}s';
-  }
+# Manage Favorites
+with st.expander("Manage Favorites"):
+    if st.session_state.favorite_songs:
+        rem = st.selectbox("Select favorite to remove", st.session_state.favorite_songs, key="fav_remove_select")
+        if st.button("Remove from favorites"):
+            st.session_state.favorite_songs = [x for x in st.session_state.favorite_songs if x != rem]
+            st.success(f"Removed {rem} from favorites")
+    else:
+        st.write("No favorites to manage.")
 
-  String _getTitleById(String id) {
-    final found = songs.firstWhere((s) => s.id == id, orElse: () => SongItem(id: id, title: id, assetPath: ''));
-    return found.title;
-  }
+# File management
+with st.expander("⚠️ Manage Files"):
+    st.write("Files in the `music/` folder:")
+    for f in songs:
+        st.write(f"- {f}")
+    del_name = st.text_input("Enter exact filename to delete (dangerous)", key="del_input")
+    if st.button("Delete file"):
+        if del_name and del_name in songs:
+            try:
+                os.remove(os.path.join(MUSIC_FOLDER, del_name))
+                st.success(f"Deleted {del_name}")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Could not delete: {e}")
+        else:
+            st.error("Filename missing or not found in folder.")
 
-  Future<void> _removeFavorite(String id) async {
-    favorites.remove(id);
-    await _savePersistentState();
-    setState(() {});
-  }
-
-  Future<void> _resetAllData() async {
-    playLog.clear();
-    favorites.clear();
-    totalSeconds = 0;
-    await _savePersistentState();
-    setState(() {});
-  }
-
-  // UI helpers
-  Widget _buildSongTile(int index) {
-    final song = songs[index];
-    final isCurrent = _currentIndex == index;
-    final isFav = favorites.contains(song.id);
-    final recentPlays = playLog[song.id]?.length ?? 0;
-
-    return Card(
-      elevation: 2,
-      margin: EdgeInsets.symmetric(vertical: 6, horizontal: 12),
-      child: ListTile(
-        leading: CircleAvatar(
-          backgroundColor: isFav ? Colors.amber : Colors.indigoAccent,
-          child: isFav ? Icon(Icons.star, color: Colors.white) : Icon(Icons.music_note, color: Colors.white),
-        ),
-        title: Text(song.title),
-        subtitle: Text('Plays (last 24h): $recentPlays'),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (isCurrent) Text(_formatPosition()),
-            IconButton(
-              icon: Icon(isCurrent && _isPlaying ? Icons.pause_circle_filled : Icons.play_circle_fill, size: 32, color: Colors.indigo),
-              onPressed: () async {
-                if (isCurrent) {
-                  if (_isPlaying) {
-                    await _pauseSong();
-                  } else {
-                    await _player.play();
-                  }
-                } else {
-                  await _playSong(index);
-                }
-              },
-            ),
-            PopupMenuButton<String>(
-              onSelected: (val) async {
-                if (val == 'fav') {
-                  if (isFav) {
-                    await _removeFavorite(song.id);
-                  } else {
-                    favorites.add(song.id);
-                    await _savePersistentState();
-                    setState(() {});
-                  }
-                } else if (val == 'info') {
-                  _showSongInfo(song);
-                }
-              },
-              itemBuilder: (context) => <PopupMenuEntry<String>>[
-                PopupMenuItem(value: 'fav', child: Text(isFav ? 'Remove Favorite' : 'Add Favorite')),
-                PopupMenuItem(value: 'info', child: Text('Song Info')),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _formatPosition() {
-    final pos = _currentPosition;
-    final dur = _currentDuration;
-    String p = _twoDigits(pos.inMinutes.remainder(60)) + ':' + _twoDigits(pos.inSeconds.remainder(60));
-    String d = dur.inMinutes.remainder(60).toString().padLeft(2, '0') + ':' + dur.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return '$p / $d';
-  }
-
-  String _twoDigits(int n) => n.toString().padLeft(2, '0');
-
-  void _showSongInfo(SongItem song) {
-    final plays = playLog[song.id] ?? [];
-    final times = plays.map((t) => DateFormat('yyyy-MM-dd HH:mm').format(t)).join('\n');
-    showDialog(context: context, builder: (_) {
-      return AlertDialog(
-        title: Text(song.title),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text('Asset: ${song.assetPath}'),
-              SizedBox(height: 8),
-              Text('Recent Plays (last 24h):'),
-              SizedBox(height: 6),
-              if (times.isNotEmpty) Text(times) else Text('No plays recorded'),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: Text('Close'))
-        ],
-      );
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('Advanced Music App'),
-        actions: [
-          IconButton(
-            icon: Icon(Icons.refresh),
-            onPressed: () => setState(() {}),
-            tooltip: 'Refresh UI',
-          ),
-          PopupMenuButton<String>(
-            onSelected: (v) {
-              if (v == 'reset') _resetAllData();
-            },
-            itemBuilder: (_) => [
-              PopupMenuItem(value: 'reset', child: Text('Reset Data')),
-            ],
-          ),
-        ],
-      ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            // Top metrics
-            Container(
-              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              color: Colors.indigo.shade50,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Text('Total Listening Time', style: TextStyle(fontSize: 12, color: Colors.grey[700])),
-                    SizedBox(height: 6),
-                    Text(_formatTotalTime(totalSeconds), style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  ]),
-                  Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                    Text('Favorites', style: TextStyle(fontSize: 12, color: Colors.grey[700])),
-                    SizedBox(height: 6),
-                    Text('${favorites.length}', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  ]),
-                ],
-              ),
-            ),
-
-            // Song list
-            Expanded(
-              child: ListView.builder(
-                itemCount: songs.length,
-                itemBuilder: (context, i) => _buildSongTile(i),
-              ),
-            ),
-
-            // Favorite list & controls
-            Container(
-              padding: EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade100,
-                border: Border(top: BorderSide(color: Colors.grey.shade300)),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: favorites.isEmpty
-                        ? Text('No favorites yet. Play a song 4+ times within 24 hours to auto-favorite it.')
-                        : SingleChildScrollView(
-                            scrollDirection: Axis.horizontal,
-                            child: Row(
-                              children: favorites.map((id) {
-                                final title = _getTitleById(id);
-                                return Padding(
-                                  padding: EdgeInsets.only(right: 8.0),
-                                  child: InputChip(
-                                    label: Text(title),
-                                    avatar: Icon(Icons.star, color: Colors.amber),
-                                    onDeleted: () => _removeFavorite(id),
-                                  ),
-                                );
-                              }).toList(),
-                            ),
-                          ),
-                  ),
-                  SizedBox(width: 8),
-                  ElevatedButton.icon(
-                    icon: Icon(Icons.stop_circle_outlined),
-                    label: Text('Stop'),
-                    style: ElevatedButton.styleFrom(primary: Colors.redAccent),
-                    onPressed: _stopSong,
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
+st.caption("Note: On cloud platforms (Streamlit Cloud) uploaded files may not be persistent; use external storage for permanent hosting.")
